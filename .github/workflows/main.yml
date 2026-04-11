@@ -1,0 +1,26 @@
+name: VPN_FARM
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install
+        run: |
+          pip install requests[socks]
+          VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d '"' -f 4 | sed 's/v//')
+          wget "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-amd64.tar.gz"
+          tar -xf sing-box-*.tar.gz && mv sing-box-*/sing-box . && chmod +x sing-box
+      - name: Work
+        run: python3 checker.py
+      - name: Push
+        run: |
+          git config --global user.name "VolunteerBot"
+          git config --global user.email "bot@vpn.com"
+          git add working.txt whitelist.txt
+          git commit -m "Update $(date)" || exit 0
+          git push

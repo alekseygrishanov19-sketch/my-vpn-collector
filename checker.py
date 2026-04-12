@@ -1,5 +1,6 @@
+
 import json, os, re, subprocess, time, requests, base64, random, socket
-from urllib.parse import urlparse, parse_qs, quote
+from urllib.parse import urlparse, parse_qs, quote, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- НАСТРОЙКИ ---
@@ -7,6 +8,7 @@ SNI_FILE, SOURCES_FILE, COUNTRY_FILE = "sni_list.txt", "sources.txt", "country_c
 CHECK_URL, XRAY_PATH = "http://ip-api.com/json/?fields=countryCode", "./xray"
 PORT_THREADS = 150  
 XRAY_THREADS = 40   
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 # -----------------
 
 def load_list(f): 
@@ -21,50 +23,69 @@ def load_json(f):
 
 def is_port_open(link):
     try:
-        parsed = urlparse(link)
+        # Очищаем ссылку от лишних пробелов по краям для парсинга
+        clean_link = link.strip()
+        parsed = urlparse(clean_link)
         if not parsed.hostname or not parsed.port: return None
-        # Проверка порта (увеличили таймаут)
         with socket.create_connection((parsed.hostname, int(parsed.port)), timeout=5):
-            return link
+            return clean_link
     except: return None
 
 def test_xray_worker(link, white_list, countries, thread_id):
     try:
         parsed = urlparse(link)
+        # Декодируем параметры, так как там могут быть спецсимволы %2F и т.д.
         params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-        sni = params.get("sni", "").lower()
+        
+        transport = params.get("type", "tcp")
+        security = params.get("security", "none")
+        sni = params.get("sni") or params.get("host", "")
         pbk = params.get("pbk")
+        
         socks_port = 11000 + thread_id
         
+        # Конфиг Xray под твои параметры (xhttp, security=none)
         config = {
             "log": {"loglevel": "none"},
             "inbounds": [{"port": socks_port, "protocol": "socks", "settings": {"udp": True}}],
             "outbounds": [{
                 "protocol": "vless",
-                "settings": {"vnext": [{"address": parsed.hostname, "port": int(parsed.port), "users": [{"id": parsed.username, "encryption": "none"}]}]},
+                "settings": {
+                    "vnext": [{
+                        "address": parsed.hostname,
+                        "port": int(parsed.port),
+                        "users": [{"id": parsed.username, "encryption": "none"}]
+                    }]
+                },
                 "streamSettings": {
-                    "network": params.get("type", "tcp"),
-                    "security": "reality" if pbk else "tls",
-                    "realitySettings": {"serverName": sni, "publicKey": pbk, "shortId": params.get("sid", ""), "fingerprint": "chrome"} if pbk else {},
-                    "tlsSettings": {"serverName": sni, "fingerprint": "chrome"} if not pbk else {}
+                    "network": transport,
+                    "security": security if security != "none" else "",
+                    "security_none": {} if security == "none" else None,
+                    "tlsSettings": {"serverName": sni, "fingerprint": "chrome"} if security == "tls" else {},
+                    "realitySettings": {"serverName": sni, "publicKey": pbk, "shortId": params.get("sid", ""), "fingerprint": "chrome"} if security == "reality" else {},
+                    "xhttpSettings": {
+                        "path": unquote(params.get("path", "/")),
+                        "host": params.get("host", ""),
+                        "mode": params.get("mode", "auto")
+                    } if transport == "xhttp" else {}
                 }
             }]
         }
+        
         cfg_name = f"tmp_{thread_id}.json"
         with open(cfg_name, "w") as f: json.dump(config, f)
         
-        # Запуск Xray
         proc = subprocess.Popen([XRAY_PATH, "-c", cfg_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2) # Даем чуть больше времени на старт
+        time.sleep(2)
         
         success, country_code, latency = False, "UN", 9999
         try:
-            st = time.time()
-            # Проверка через прокси
-            r = requests.get(CHECK_URL, proxies={"http":f"socks5://127.0.0.1:{socks_port}","https":f"socks5://127.0.0.1:{socks_port}"}, timeout=10)
+            proxies = {"http":f"socks5://127.0.0.1:{socks_port}","https":f"socks5://127.0.0.1:{socks_port}"}
+            start_t = time.time()
+            r = requests.get(CHECK_URL, proxies=proxies, timeout=10)
             if r.status_code == 200:
                 country_code = r.json().get("countryCode", "UN")
-                latency = int((time.time() - st) * 1000)
+                latency = int((time.time() - start_t) * 1000)
                 success = True
         except: pass
         
@@ -74,8 +95,15 @@ def test_xray_worker(link, white_list, countries, thread_id):
         
         if success:
             country = countries.get(country_code, country_code)
-            tag = f"{'RDL' if pbk else 'TLS'}-{sni if sni else 'no-sni'}-{country}-{latency}ms".replace(' ', '_')
-            return {"link": f"{link.split('#')[0]}#{quote(tag)}", "white": sni in white_list, "latency": latency, "id": f"{parsed.hostname}_{sni}"}
+            clean_base = link.split('#')[0]
+            # Твое пожелание: Страна Протокол SNI (или транспорт)
+            new_name = f"{country}-{transport}-{sni if sni else 'no-sni'}".replace(' ', '_')
+            return {
+                "link": f"{clean_base}#{quote(new_name)}",
+                "white": sni in white_list,
+                "latency": latency,
+                "id": f"{parsed.hostname}_{sni}_{transport}"
+            }
     except: pass
     return None
 
@@ -83,31 +111,32 @@ def main():
     white_list, countries = load_list(SNI_FILE), load_json(COUNTRY_FILE)
     sources = load_list(SOURCES_FILE)
     
-    if not sources:
-        print("!!! ОШИБКА: Файл sources.txt пуст или не найден!")
-        return
-
-    print(f"--- 1. Сбор ссылок из {len(sources)} источников ---")
+    print(f"--- 1. Сбор ссылок ---")
     raw_links = []
     for url in sources:
         try:
-            res = requests.get(url, timeout=15).text
-            # Улучшенный Regex
-            found = re.findall(r'vless://[^\s"\'<>]+', res)
+            res = requests.get(url, headers=HEADERS, timeout=15).text
+            # Регулярка, которая берет всё от vless:// до конца строки, игнорируя пробелы внутри
+            found = re.findall(r'(vless://[^\n\r]+)', res)
+            
+            # Если файл пустой, пробуем Base64 (часто подписки кодируют целиком)
+            if not found:
+                try:
+                    decoded = base64.b64decode(res.strip()).decode('utf-8')
+                    found = re.findall(r'(vless://[^\n\r]+)', decoded)
+                except: pass
+            
             raw_links.extend(found)
-            print(f"Из {url} взято {len(found)} ссылок")
+            print(f"Источник {url}: Найдено {len(found)}")
         except Exception as e:
-            print(f"Ошибка при загрузке {url}: {e}")
+            print(f"Ошибка {url}: {e}")
     
-    unique_links = list(set(raw_links))
-    total = len(unique_links)
-    if total == 0:
-        print("!!! ССЫЛОК НЕ НАЙДЕНО. Проверь источники!")
+    unique_links = list(set([l.strip() for l in raw_links if "vless://" in l]))
+    if not unique_links:
+        print("!!! Ключи не найдены. Проверь sources.txt")
         return
-    print(f"Всего уникальных: {total}")
 
-    # ЭТАП 1
-    print(f"--- 2. Скрининг портов ({PORT_THREADS} потоков) ---")
+    print(f"--- 2. Чек портов ({len(unique_links)} шт.) ---")
     alive_ports = []
     with ThreadPoolExecutor(max_workers=PORT_THREADS) as executor:
         futures = [executor.submit(is_port_open, link) for link in unique_links]
@@ -115,49 +144,31 @@ def main():
             res = f.result()
             if res: alive_ports.append(res)
     
-    print(f"Порты открыты у {len(alive_ports)} ключей.")
-    if not alive_ports:
-        print("!!! Ни один порт не ответил. Либо все ключи мертвы, либо GitHub блокирует исходящие.")
-        return
+    print(f"Порты открыты: {len(alive_ports)}")
 
-    # ЭТАП 2
-    print(f"--- 3. Глубокий тест Xray ({XRAY_THREADS} потоков) ---")
-    results_normal, results_white, seen_ids = [], [], set()
-    
+    print(f"--- 3. Тест Xray ---")
+    results = []
+    seen_ids = set()
     with ThreadPoolExecutor(max_workers=XRAY_THREADS) as executor:
         futures = [executor.submit(test_xray_worker, link, white_list, countries, i % XRAY_THREADS) for i, link in enumerate(alive_ports)]
         for f in as_completed(futures):
             res = f.result()
             if res and res["id"] not in seen_ids:
-                if res["white"]: results_white.append(res)
-                else: results_normal.append(res)
+                results.append(res)
                 seen_ids.add(res["id"])
 
-    # Сортировка
-    results_normal.sort(key=lambda x: x['latency'])
-    results_white.sort(key=lambda x: x['latency'])
+    # Сортировка по пингу
+    results.sort(key=lambda x: x['latency'])
+    final_links = [r['link'] for r in results]
     
-    w_list = [r['link'] for r in results_normal]
-    wh_list = [r['link'] for r in results_white]
+    with open("working.txt", "w", encoding='utf-8') as f: f.write("\n".join(final_links))
     
-    # ЗАПИСЬ
-    print(f"--- 4. Сохранение результатов (Рабочих: {len(w_list + wh_list)}) ---")
-    
-    with open("working.txt", "w", encoding='utf-8') as f: 
-        f.write("\n".join(w_list))
-    
-    with open("whitelist.txt", "w", encoding='utf-8') as f: 
-        f.write("\n".join(wh_list))
-    
-    if w_list + wh_list:
-        combined = "\n".join(w_list + wh_list)
-        encoded = base64.b64encode(combined.encode('utf-8')).decode('utf-8')
+    if final_links:
+        sub_content = base64.b64encode("\n".join(final_links).encode()).decode()
         with open("sub.txt", "w", encoding='utf-8') as f:
-            f.write(encoded)
-        print("Файл sub.txt успешно записан.")
+            f.write(sub_content)
+        print(f"Готово! Рабочих: {len(final_links)}")
     else:
-        # Чтобы sub.txt не был старым, очистим его если ничего не нашли
-        open("sub.txt", "w").close()
-        print("Рабочих ключей 0, файлы очищены.")
+        print("Живых ключей не найдено.")
 
 if __name__ == "__main__": main()

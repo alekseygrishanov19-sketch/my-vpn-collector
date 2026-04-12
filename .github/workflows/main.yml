@@ -1,28 +1,52 @@
-name: XRAY_FARM_HOURLY
+name: XRAY_MEGA_CHECKER_100K
 on:
   schedule:
-    - cron: '0 * * * *' # Каждый час
-  workflow_dispatch:
+    - cron: '0 */12 * * *' # Запуск каждые 12 часов (в 00:00 и 12:00)
+  workflow_dispatch:      # Кнопка для ручного запуска в разделе Actions
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Увеличиваем таймаут до 4 часов, так как 100к ключей — это долго
+    timeout-minutes: 240 
+
     steps:
-      - uses: actions/checkout@v3
-      - name: Install Dependencies
-        run: pip install requests[socks]
+      # 1. Загружаем код из репозитория
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Устанавливаем Python
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      # 3. Устанавливаем необходимые библиотеки
+      - name: Install dependencies
+        run: |
+          pip install requests[socks]
+
+      # 4. Скачиваем и устанавливаем Xray Core (последнюю версию)
       - name: Install Xray
         run: |
           VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep tag_name | cut -d '"' -f 4)
+          echo "Installing Xray version $VERSION"
           wget "https://github.com/XTLS/Xray-core/releases/download/${VERSION}/Xray-linux-64.zip"
           unzip Xray-linux-64.zip
           chmod +x xray
-      - name: Run Farm
+          ./xray version # Проверка, что xray работает
+
+      # 5. Запускаем наш мощный скрипт
+      - name: Run MEGA Checker
         run: python3 checker.py
-      - name: Push Results
+
+      # 6. Сохраняем результаты (working.txt, whitelist.txt, sub.txt) обратно в репозиторий
+      - name: Push results to repository
         run: |
-          git config --global user.name "XrayBot"
-          git config --global user.email "bot@xray.com"
+          git config --global user.name "Xray-Mega-Bot"
+          git config --global user.email "mega-bot@vpn.com"
+          # Добавляем файлы, если они изменились
           git add working.txt whitelist.txt sub.txt
-          git commit -m "Update: $(date)" || exit 0
+          # Коммитим, если есть изменения. Если изменений нет, скрипт не упадет (exit 0)
+          git commit -m "Update: $(date +'%Y-%m-%d %H:%M:%S') [100k Check]" || exit 0
           git push
